@@ -612,8 +612,10 @@ display_top_tabs($tab_array);
 					<span class="help-block">Inverse</span>
 				</div>
 				<div class="col-sm-2">
-					<select class="form-control" data-toggle="tooltip" data-trigger="hover" data-placement="top" title="You must save this view for the refresh interval to take effect." id="refresh-interval" name="refresh-interval">
+					<select class="form-control" data-toggle="tooltip" data-trigger="hover" data-placement="top" title="The refresh interval will take effect immediately." id="refresh-interval" name="refresh-interval">
 						<option value="0" selected>Never</option>
+						<option value="-1">Settings Change</option>
+						<option value="-2">Auto Sync</option>
 						<option value="60000">1 Minute</option>
 						<option value="300000">5 Minutes</option>
 						<option value="600000">10 Minutes</option>
@@ -685,10 +687,12 @@ display_top_tabs($tab_array);
 
 <div class="panel panel-default">
 	<div class="panel-heading">
-		<h2 class="panel-title">Interactive Graph</h2>
+		<h2 class="panel-title" style="display:inline-block">
+			Interactive Graph
+		</h2>
+		<span class="fa fa-spinner fa-pulse fa-lg fa-fw" id="loading-msg"></span>
 	</div>
 	<div class="panel-body">
-		<div class="alert alert-info" id="loading-msg">Loading Graph...</div>
 		<div id="chart-error" class="alert alert-danger" style="display: none;"></div>
 		<div id="monitoring-chart" class="d3-chart">
 			<svg id="monitoring-svg"></svg>
@@ -1021,9 +1025,13 @@ events.push(function() {
       changeYear: true,
     });
 
+	var applying_settings = false;	// Flag to signal handlers not to fire off multiple draw graph calls while options are being applied/changed.
+
 	function applySettings(defaults) {
 
 		var allOptions = defaults.split("&");
+
+		applying_settings = true;
 
 		allOptions.forEach(function(entry) {
 
@@ -1139,6 +1147,8 @@ events.push(function() {
 
 		}, this);
 
+		applying_settings = false;
+
 	}
 
 	applySettings("<?php echo $pconfig['category']; ?>");
@@ -1190,7 +1200,6 @@ events.push(function() {
 	});
 
 	$( ".update-graph" ).click(function() {
-		$("#monitoring-chart").hide();
 		$("#loading-msg").show();
 		$("#chart-error").hide();
 		draw_graph(getOptions());
@@ -1309,6 +1318,9 @@ events.push(function() {
 			}
 
 			var data = json;
+
+			step = data[0].step;
+			last_updated = data[0].last_updated;
 
 			data.map(function(series) {
 
@@ -1566,6 +1578,100 @@ events.push(function() {
 		$('acronym').tooltip();
 	}
 
+	// Refresh graph scheduler.
+	var step;
+	var last_updated;
+	var refresh_id;
+
+	function refresh_graph_scheduler() {
+
+		clearTimeout(refresh_id);
+
+		// If refresh is not enabled, or is set to non scheduled setting, ensure not to schedule a refresh.
+		if (( $( "#refresh-interval" ).val() == "0") || ( $( "#refresh-interval" ).val() == "-1")) {
+			return false;
+		}
+
+		step = 0;
+		last_updated = 0;
+
+		var timesToWait = 15;
+		var wait_for_update = setInterval(function(){
+			timesToWait -= 1;
+			if (timesToWait < 1) { clearInterval(wait_for_update); }
+
+			if ((step > 0 && last_updated > 0) || $( "#refresh-interval" ).val() >= "1000") {
+				clearInterval(wait_for_update);
+
+				var refresh_interval = 0;
+				var rrd_update_interval = 62;
+
+				// Synchronize refresh with RRD resolution step and update interval, plus a cushion to ensure RRD has been updated.
+				if ( $( "#refresh-interval" ).val() == "-2") {		// Auto Sync option selected
+					var now = Math.floor(Date.now() / 1000);
+					var last_update = Math.floor(last_updated / 1000);
+					var last_step_boundary = (Math.floor(now / step) * step);
+
+					// Handle case in which the next update can be prior to the next step boundary.  Typically only happens on first pass when starting, or if update occurred on step boundary).
+					if (last_update <= last_step_boundary) {
+						var next_update = last_update + rrd_update_interval;
+						refresh_interval = next_update - now;
+					} else {
+						var next_step_boundary = last_step_boundary + step;
+						var next_update_past_next_step_boundry = next_step_boundary + (rrd_update_interval - ((next_step_boundary - last_update) % rrd_update_interval));
+						refresh_interval = next_update_past_next_step_boundry - now;
+					}
+
+					// Add 3 percent of step, clipped to a maximum of RRD update interval, as a cushion to allow for drift and ensure RRD update had time to complete.
+					refresh_interval += Math.min((step / 33), rrd_update_interval);
+				}
+
+				// Synchronize refresh to top of the minute (seconds = 0).  The soonest that RRD is certain to have a sample data point for the previous minute.
+				if ( $( "#refresh-interval" ).val() >= "1000") {		// Specific update interval selected
+					refresh_interval = (($( "#refresh-interval" ).val() / 1000) - new Date().getSeconds());
+				}
+
+				// Keep refresh working if a condition results in an invalid refresh interval.  Such as RRD update fails to occur.
+				if (refresh_interval < 1) {
+					refresh_interval = rrd_update_interval;
+				}
+
+				// Schedule the graph refresh.
+				if (refresh_interval > 0) {
+					refresh_id = setTimeout(function(){
+						$("#chart-error").hide();
+						draw_graph(getOptions());
+						refresh_graph_scheduler();
+					}, refresh_interval * 1000);
+				}
+			}
+		}, 1000);
+	}
+
+	// Refresh graph when settings changes are made.
+	$('#category-left, #category-right, #graph-left, #graph-right, #time-period, #resolution, #graph-type, #invert, #start-date, #end-date, #start-time, #end-time').on('change', function() {
+		if (!applying_settings) {
+			// If one of the refresh intervals, "Auto Sync", or "Settings Change" options is selected.
+			if (($( "#refresh-interval" ).val() >= 1000) || ($( "#refresh-interval" ).val() == -2) || ($( "#refresh-interval" ).val() == -1)) {
+				$("#chart-error").hide();
+				draw_graph(getOptions());
+				refresh_graph_scheduler();
+			}
+		}
+	});
+
+	// Apply refresh interval setting immediately when changed.
+	$('#refresh-interval').on('change', function() {
+		if (!applying_settings) {
+			// If one of the refresh intervals or "Auto Sync" options is selected.
+			if (($( "#refresh-interval" ).val() >= 1000) || ($( "#refresh-interval" ).val() == -2)) {
+				$("#chart-error").hide();
+				draw_graph(getOptions());
+			}
+			refresh_graph_scheduler();
+		}
+	});
+
 	var chart;
 
 	<?php
@@ -1585,16 +1691,7 @@ events.push(function() {
 	} else {
 
 		draw_graph(getOptions());
-
-		var refresh_interval = $( "#refresh-interval" ).val();
-
-		if(refresh_interval > 0) {
-
-			var refresh_id = Visibility.every(refresh_interval, function () {
-			    draw_graph(getOptions());
-			});
-
-		}
+		refresh_graph_scheduler();
 
 	}
 
